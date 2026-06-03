@@ -38,6 +38,10 @@ python main.py
 | **Проверка** | Отправляет весь распарсенный текст в Yandex NeuroDetector API |
 | **Результат** | Показывает % AI / Human по сегментам + вердикт |
 
+
+<img width="1045" height="875" alt="Основное окно" src="https://github.com/user-attachments/assets/875b55be-0e19-4b1d-9e52-86502a0658cd" />
+
+
 ### Принцип работы
 
 1. **Оглавление** — скрипт загружает страницу произведения (`/work/{id}`) и извлекает список глав из вкладки «Оглавление» (`ul.table-of-content`). Никакого JavaScript — чистый HTML.
