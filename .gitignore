@@ -29,3 +29,8 @@ logs/
 # Data
 data/
 *.db
+
+# Локальные офлайн-тесты (venv pytest): в публичный репозиторий не выкладываем
+tests/
+requirements-dev.txt
+
