@@ -12,6 +12,7 @@
 главы НЕ должна означать конец книги. Платная глава — означает.
 """
 import logging
+import os
 import random
 import re
 import time
@@ -45,6 +46,10 @@ READER_HREF_RE = re.compile(r'/reader/(\d+)/(\d+)')
 
 # Ниже этого порога считаем, что текста нет (нормальные главы на AT — тысячи символов).
 MIN_CHAPTER_CHARS = 120
+# Меньше этого среднего на главу — результат подозрительный: так выглядит не текст книги,
+# а обрывки страницы (в отчётах беты заглушка давала ~1000 знаков на главу при норме
+# 12 000–35 000). Такие проверки нельзя показывать зелёным «готово».
+MIN_AVG_CHAPTER = 1500
 
 # Индикаторы замка в уже отрендеренной странице читалки (второй, резервный слой проверки).
 RENDERED_LOCK_MARKERS = (
@@ -52,6 +57,18 @@ RENDERED_LOCK_MARKERS = (
     'чтобы продолжить чтение', 'оплатите доступ', 'приобретите доступ',
 )
 RENDERED_LOCK_SELECTOR = '.authorize-form, .buy-form, .content-lock, [class*="content-lock"]'
+
+# До подтверждения возраста author.today не отдаёт текст 18+ книги вовсе: вместо читалки
+# открывается страница-заглушка с кнопкой «Да, мне есть 18» и БЕЗ #text-container.
+# Измерено на живых книгах: ~800–2300 знаков служебного текста, абзацев главы нет.
+AGE_GATE_MARKERS = ('старше 18 лет', 'мне есть 18', 'взрослый контент')
+AGE_CONFIRM_JS = """
+const btn = Array.from(document.querySelectorAll('button, a'))
+    .find(e => /мне есть 18/i.test((e.innerText || '').trim()));
+if (!btn) return false;
+btn.click();
+return true;
+"""
 
 # Извлечение текста выполняется одним JS-вызовом: быстрее и устойчивее, чем
 # последовательность find_element, и заодно даёт признаки замка в той же порции.
@@ -92,6 +109,12 @@ return out;
 """ % RENDERED_LOCK_SELECTOR
 
 
+def _default_profile_dir() -> str:
+    """Профиль Chrome живёт рядом с историей (data/ в .gitignore)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, 'data', 'chrome-profile')
+
+
 class AuthorTodayReader:
     """Загрузка оглавления и текста глав с author.today"""
 
@@ -102,12 +125,17 @@ class AuthorTodayReader:
         render_wait: float = 12.0,
         page_load_timeout: float = 45.0,
         block_images: bool = False,
+        profile_dir: Optional[str] = None,
     ):
         self.headless = headless
         self.max_attempts = max(1, int(max_attempts))
         self.render_wait = render_wait
         self.page_load_timeout = page_load_timeout
         self.block_images = block_images
+        # Профиль Chrome переиспользуется между запусками: в нём живёт кука AdultUser
+        # (подтверждение 18+) и сервисные куки сайта, то есть гейт проходится один раз,
+        # а не на каждой книге. '' — профиль не использовать.
+        self.profile_dir = profile_dir if profile_dir is not None else _default_profile_dir()
 
         self.client = httpx.Client(
             base_url='https://author.today',
@@ -121,6 +149,7 @@ class AuthorTodayReader:
         self._driver: Optional[WebDriver] = None
         self._session_cookies: Dict[str, str] = {}
         self.logged_in = False
+        self.age_confirmed = False
 
     # ------------------------------------------------------------------
     # Сессия (авторизация)
@@ -166,19 +195,26 @@ class AuthorTodayReader:
     # Selenium — драйвер для рендеринга JS, с самовосстановлением
     # ------------------------------------------------------------------
     def _build_driver(self) -> WebDriver:
-        options = self._chrome_options()
         errors = []
+        attempts = []
+        if self.profile_dir:
+            attempts.append((self._chrome_options(True), 'с профилем'))
+        attempts.append((self._chrome_options(False), 'без профиля'))
 
-        for factory in self._driver_factories():
-            try:
-                driver = factory(options)
-            except Exception as e:
-                errors.append(f"{factory.__name__}: {e}")
-                logger.warning("Драйвер не поднялся: %s", e)
-                continue
-            driver.set_page_load_timeout(self.page_load_timeout)
-            driver.set_script_timeout(60)
-            return driver
+        for options, label in attempts:
+            for factory in self._driver_factories():
+                try:
+                    driver = factory(options)
+                except Exception as e:
+                    errors.append(f"{label}/{factory.__name__}: {e}")
+                    logger.warning("Драйвер не поднялся (%s): %s", label, e)
+                    continue
+                if label == 'без профиля' and self.profile_dir:
+                    logger.warning("Профиль %s недоступен (возможно, занят) — поднимаю чистый профиль",
+                                   self.profile_dir)
+                driver.set_page_load_timeout(self.page_load_timeout)
+                driver.set_script_timeout(60)
+                return driver
 
         raise RuntimeError("Не удалось запустить Chrome для парсинга: " + " | ".join(errors))
 
@@ -198,7 +234,7 @@ class AuthorTodayReader:
         factories.append(via_selenium_manager)
         return factories
 
-    def _chrome_options(self) -> Options:
+    def _chrome_options(self, with_profile: bool = True) -> Options:
         options = Options()
         if self.headless:
             # headless=new — современный режим (Chrome 109+); в старых версиях его нет.
@@ -212,9 +248,15 @@ class AuthorTodayReader:
         options.add_argument('--lang=ru-RU')
         # Ширина влияет на то, что сайт считает «видимым» — важно для проверки замка.
         options.add_argument('--window-size=1920,1080')
-        options.add_argument(f'user-agent={USER_AGENT}')
-        options.add_experimental_option('excludeSwitches', ['enable-logging'])
-        options.add_experimental_option('excludeSwitches', ['enable-automation'])
+        if with_profile and self.profile_dir:
+            try:
+                os.makedirs(self.profile_dir, exist_ok=True)
+                options.add_argument(f'--user-data-dir={self.profile_dir}')
+            except OSError as e:
+                logger.warning("Профиль создать не удалось (%s) — без него", e)
+        # User-Agent не подменяем: несогласованный UA (Chrome/120 при реальном 152) —
+        # это типичный признак автоматизации, а выгоды от подмены нет.
+        options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
         options.add_experimental_option('useAutomationExtension', False)
         prefs = {'credentials_enable_service': False,
                  'profile.password_manager_enabled': False}
@@ -347,6 +389,16 @@ class AuthorTodayReader:
                 info['paid_stopped'] = True
                 _emit(progress_callback, num, total, chapter.title, "ПЛАТНАЯ — остановка")
                 break
+            elif res.status is ChapterStatus.BLOCKED:
+                # Гейт, который не удалось снять, на первой же главе означает, что вся
+                # книга сейчас нечитаема в этой сессии. Продолжать — только сжигать время.
+                info['blocked'].append({'num': num, 'title': chapter.title,
+                                        'reason': res.error, 'attempts': res.attempts})
+                info['blocked_stopped'] = True
+                _emit(progress_callback, num, total, chapter.title,
+                      f"ЗАКРЫТО САЙТОМ ({res.error}) — остановка")
+                logger.warning("Глава %r закрыта страницей-заглушкой: %s", chapter.title, res.error)
+                break
             else:
                 info['failed'].append({'num': num, 'title': chapter.title,
                                        'reason': res.error or res.status.value,
@@ -361,7 +413,15 @@ class AuthorTodayReader:
 
         info['parsed'] = parsed
         info['total_chars'] = total_chars
+        if parsed:
+            info['avg_chars'] = total_chars // parsed
+            info['thin'] = info['avg_chars'] < MIN_AVG_CHAPTER
+        info['age_confirmed'] = self.age_confirmed
         info['elapsed'] = round(time.time() - started, 1)
+        if not parsed and info['blocked']:
+            info['error'] = (f"сайт отдаёт вместо текста страницу-заглушку "
+                             f"({info['blocked'][0]['reason']}). Помогает вход в аккаунт: "
+                             f"отметка «вход из .env»")
         logger.info("Завершено: %d глав из %d попыток, %d символов, %0.1fс",
                     parsed, total, total_chars, info['elapsed'])
         return "\n".join(blocks), info
@@ -370,7 +430,12 @@ class AuthorTodayReader:
     # Глава: попытки, рендер, извлечение
     # ------------------------------------------------------------------
     def _load_chapter(self, chapter: Chapter) -> ChapterResult:
-        """Грузит одну главу с ретраями. PAID возвращается сразу, ERROR/EMPTY — повторяются."""
+        """Грузит одну главу с ретраями.
+
+        OK/PAID/BLOCKED возвращаются сразу: BLOCKED — не временный сбой, а состояние
+        страницы (гейт, который мы не смогли снять), и долбить его попытками значит
+        просто сжигать время прогона.
+        """
         t0 = time.time()
         last = ChapterResult(chapter=chapter, status=ChapterStatus.ERROR, source='none',
                              error='глава не парсилась')
@@ -395,7 +460,7 @@ class AuthorTodayReader:
             last.attempts = attempt
             last.elapsed = time.time() - t0
 
-            if last.status in (ChapterStatus.OK, ChapterStatus.PAID):
+            if last.status in (ChapterStatus.OK, ChapterStatus.PAID, ChapterStatus.BLOCKED):
                 return last
 
             if attempt < self.max_attempts:
@@ -407,53 +472,93 @@ class AuthorTodayReader:
         return last
 
     def _extract_after_render(self, driver: WebDriver, chapter: Chapter) -> ChapterResult:
-        """Ждёт JS-рендер и извлекает текст. Ждёт стабильности, а не фиксированные секунды."""
-        try:
-            WebDriverWait(driver, min(20, self.render_wait + 5)).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, '#text-container')))
-        except Exception:
-            logger.debug("#text-container не появился за отведённое время: %s", chapter.url)
+        """Ждёт JS-рендер и извлекает текст.
 
-        snapshot = self._snapshot(driver)
+        Порядок важен: сначала ловим страницу-заглушку (возрастной гейт) и пробуем её
+        снять, только потом имеет смысл ждать текст.
+        """
+        snapshot = self._wait_for_render(driver, chapter)
         if snapshot is None:
             return ChapterResult(chapter=chapter, status=ChapterStatus.ERROR, source='none',
                                  error='страница не ответила (JS недоступен)')
 
-        # Дожидаемся, пока объём текста перестанет расти: Knockout дописывает абзацы порциями.
-        # Ждём именно стабильности, а не первого попавшегося куска текста, иначе глава
-        # ушла бы в анализ недогрузившейся.
-        deadline = time.time() + self.render_wait
+        if not snapshot.get('hasContainer') and _is_age_gate(snapshot):
+            if self._confirm_age(driver, chapter.url):
+                snapshot = self._wait_for_render(driver, chapter, self.render_wait)
+                if snapshot is None:
+                    return ChapterResult(chapter=chapter, status=ChapterStatus.ERROR,
+                                         source='none',
+                                         error='страница пропала после подтверждения возраста')
+                result = _classify_render(chapter, snapshot)
+                if result.status is ChapterStatus.OK:
+                    result.error = 'возрастной гейт 18+ подтверждён автоматически'
+                return result
+            return ChapterResult(chapter=chapter, status=ChapterStatus.BLOCKED, source='none',
+                                 error='требует подтверждения 18+: кнопка «Да, мне есть 18» не найдена')
+
+        return _classify_render(chapter, snapshot)
+
+    def _wait_for_render(self, driver: WebDriver, chapter: Chapter,
+                         wait: Optional[float] = None) -> Optional[dict]:
+        """Ждёт, пока объём текста перестанет расти.
+
+        Ждём стабильности, а не первого куска: иначе глава ушла бы в анализ
+        недогрузившейся. Фиксированной паузы нет — при заглушке выходим сразу.
+        """
+        budget = wait if wait is not None else self.render_wait
+        try:
+            WebDriverWait(driver, min(20, budget + 5)).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, '#text-container')))
+        except Exception:
+            logger.debug("#text-container не появился: %s", chapter.url)
+
+        snapshot = self._snapshot(driver)
+        if snapshot is None:
+            return None
+
+        deadline = time.time() + budget
         stable = 0
         prev_len = snapshot.get('pLen', 0)
         while time.time() < deadline:
             if prev_len >= MIN_CHAPTER_CHARS and stable >= 2:
                 break
+            if not snapshot.get('hasContainer') and _is_age_gate(snapshot):
+                break                       # заглушка: ждать бессмысленно
+            if _looks_locked(snapshot) and prev_len < MIN_CHAPTER_CHARS:
+                break
             time.sleep(0.4)
             current = self._snapshot(driver)
             if current is None:
-                return ChapterResult(chapter=chapter, status=ChapterStatus.ERROR, source='none',
-                                     error='страница отвалилась при рендере')
+                return None
             length = current.get('pLen', 0)
             stable = stable + 1 if length == prev_len else 0
             prev_len = length
             snapshot = current
-            if _looks_locked(current) and length < MIN_CHAPTER_CHARS:
-                break
 
-        locked = _looks_locked(snapshot)
-        text, source = _pick_text(snapshot)
+        return snapshot
 
-        if len(text) >= MIN_CHAPTER_CHARS:
-            return ChapterResult(chapter=chapter, status=ChapterStatus.OK, text=text,
-                                 source=source)
-        if locked:
-            return ChapterResult(chapter=chapter, status=ChapterStatus.PAID, source='none',
-                                 error='подтверждённый платный доступ')
-        if not snapshot.get('hasContainer'):
-            return ChapterResult(chapter=chapter, status=ChapterStatus.ERROR, source='none',
-                                 error='нет #text-container на странице')
-        return ChapterResult(chapter=chapter, status=ChapterStatus.EMPTY, source='none',
-                             text='', error='рендер не вернул текста')
+    def _confirm_age(self, driver: WebDriver, url: str) -> bool:
+        """Жмёт «Да, мне есть 18» — ровно то, что делает человек.
+
+        Сайт после этого ставит куку AdultUser, и текст главы начинает отдаваться
+        и без входа в аккаунт.
+        """
+        try:
+            clicked = driver.execute_script(AGE_CONFIRM_JS)
+        except WebDriverException as e:
+            logger.warning("Кнопка подтверждения возраста недоступна: %s", str(e).splitlines()[0])
+            return False
+        if not clicked:
+            return False
+        logger.info("Подтверждаю возраст 18+ (кнопка «Да, мне есть 18»)")
+        try:
+            time.sleep(1.0)
+            driver.get(url)
+            self.age_confirmed = True
+            return True
+        except WebDriverException as e:
+            logger.warning("Перечитать главу после гейта не вышло: %s", str(e).splitlines()[0])
+            return False
 
     def _snapshot(self, driver: WebDriver) -> Optional[dict]:
         try:
@@ -596,8 +701,49 @@ def _looks_locked(snapshot: dict) -> bool:
     return False
 
 
+def _is_age_gate(snapshot: dict) -> bool:
+    """Страница-заглушка «подтвердите 18+» вместо текста главы."""
+    body = (snapshot.get('bodyText') or '').lower()
+    return any(marker in body for marker in AGE_GATE_MARKERS)
+
+
+def _classify_render(chapter: Chapter, snapshot: dict) -> ChapterResult:
+    """Вердикт по отрендеренной странице главы.
+
+    Правило, из-за которого раньше рождались ложные «0% / написан человеком»:
+    текстом главы считается ТОЛЬКО содержимое #text-container. Служебный текст
+    страницы (карточка книги, меню, куки-баннер) в детектор не уходит никогда —
+    ~1000 знаков навигации Яндекс честно классифицирует как человеческий текст,
+    и книга с 90% ИИ получает зелёное «написан человеком».
+    """
+    if not snapshot.get('hasContainer'):
+        if _is_age_gate(snapshot):
+            return ChapterResult(chapter=chapter, status=ChapterStatus.BLOCKED, source='none',
+                                 error='страница ждёт подтверждения возраста 18+')
+        if _looks_locked(snapshot):
+            return ChapterResult(chapter=chapter, status=ChapterStatus.PAID, source='none',
+                                 error='подтверждённый платный доступ')
+        return ChapterResult(chapter=chapter, status=ChapterStatus.ERROR, source='none',
+                             error='на странице нет #text-container (это не читалка)')
+
+    text, source = _pick_text(snapshot)
+    if len(text) >= MIN_CHAPTER_CHARS:
+        return ChapterResult(chapter=chapter, status=ChapterStatus.OK, text=text, source=source)
+    if _looks_locked(snapshot):
+        return ChapterResult(chapter=chapter, status=ChapterStatus.PAID, source='none',
+                             error='подтверждённый платный доступ')
+    if _is_age_gate(snapshot):
+        return ChapterResult(chapter=chapter, status=ChapterStatus.BLOCKED, source='none',
+                             error='страница ждёт подтверждения возраста 18+')
+    return ChapterResult(chapter=chapter, status=ChapterStatus.EMPTY, source='none',
+                         error='рендер не вернул текста')
+
+
 def _pick_text(snapshot: dict) -> Tuple[str, str]:
-    """Цепочка источников: абзацы контейнера → текст контейнера → body (крайний случай)."""
+    """Только контейнер главы: абзацы → текст контейнера целиком.
+
+    body-фолбек убран намеренно: он превращал страницу-заглушку в «успешную» главу.
+    """
     p_text = (snapshot.get('pText') or '').strip()
     if snapshot.get('pCount', 0) > 0 and len(p_text) >= MIN_CHAPTER_CHARS:
         return p_text, 'container-p'
@@ -606,11 +752,7 @@ def _pick_text(snapshot: dict) -> Tuple[str, str]:
     if len(c_text) >= MIN_CHAPTER_CHARS:
         return c_text, 'container'
 
-    body = (snapshot.get('bodyText') or '').strip()
-    if len(body) >= MIN_CHAPTER_CHARS:
-        return body, 'body'
-
-    return (p_text or c_text or body), 'none'
+    return p_text or c_text, 'none'
 
 
 def _empty_chapters_info(book_id: int) -> Dict:
@@ -628,8 +770,13 @@ def _empty_chapters_info(book_id: int) -> Dict:
         'sources': {},
         'paid_chapter': None,
         'paid_stopped': False,
+        'blocked': [],
+        'blocked_stopped': False,
         'stopped_early': False,
         'total_chars': 0,
+        'avg_chars': 0,
+        'thin': False,
+        'age_confirmed': False,
         'elapsed': 0.0,
         'error': '',
     }

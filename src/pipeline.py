@@ -37,6 +37,7 @@ class Settings:
     detector_attempts: int = 4
     skip_checked_hours: float = 0.0   # >0: не пере-парсить книги, проверенные недавно
     save_text: bool = True            # кэш текста для «перепроверить без парсинга»
+    use_profile: bool = True          # профиль Chrome переиспользуется: в нём живёт кука 18+
 
     @staticmethod
     def from_dict(data: Dict) -> 'Settings':
@@ -184,23 +185,39 @@ def check_one(
     record['chapters_total'] = info.get('free_in_toc', 0) or info.get('attempted', 0)
     record['chapters_parsed'] = info.get('parsed', 0)
     record['chapters_failed'] = len(info.get('failed') or [])
+    record['chapters_blocked'] = len(info.get('blocked') or [])
     record['chapters_locked'] = info.get('paid_in_toc', 0)
     record['paid_chapter'] = info.get('paid_chapter')
     record['chars'] = info.get('total_chars', len(text))
+    record['avg_chars'] = info.get('avg_chars', 0)
     record['stopped_early'] = bool(info.get('stopped_early'))
+    record['age_confirmed'] = bool(info.get('age_confirmed'))
 
     if info.get('error'):
         record['error'] = info['error']
 
     if not text:
-        record['status'] = 'no_text'
-        record['error'] = record['error'] or 'текст не получен'
+        if info.get('blocked'):
+            # Страница-заглушка (возраст/вход) — это не «книга чистая», это «мы ничего не увидели».
+            record['status'] = 'blocked'
+            base = record['error'] or 'сайт отдаёт страницу-заглушку вместо текста глав'
+            if '.env' not in base and 'вход' not in base.lower():
+                base += ' — помогает вход в аккаунт: отметка «вход из .env»'
+            record['error'] = base
+        else:
+            record['status'] = 'no_text'
+            record['error'] = record['error'] or 'текст не получен'
         record['detail'] = _detail(info)
         record['elapsed'] = round(time.time() - started, 1)
         return record
 
     if not record['chapters_parsed']:
         record['chapters_parsed'] = len(re.findall(r'^=== .+ ===$', text, re.M)) or 1
+
+    # Мало текста на главу — вывод статистически слабый. Не ошибка, но и не «готово».
+    if info.get('thin'):
+        record['warning'] = (f"в среднем {record['avg_chars']} знаков на главу — "
+                             f"на таком объёме вывод ненадёжен")
 
     # Отправка в детектор
     cb.detecting(0, 1, f"отправка {len(text)} симв.")
@@ -221,13 +238,23 @@ def check_one(
         record['elapsed'] = round(time.time() - started, 1)
         return record
 
-    record['status'] = 'partial' if result.get('partial') else 'ok'
+    # Статус учитывает и потери на стороне сайта, и сбои фрагментов: «зелёное готово»
+    # не должно появляться, когда половина глав вообще не была прочитана.
+    lost = record['chapters_failed'] + record['chapters_blocked']
+    record['status'] = 'partial' if (result.get('partial') or lost) else 'ok'
     record['ai_percent'] = result.get('ai_percent')
     record['human_percent'] = result.get('human_percent')
     record['verdict'] = result.get('verdict', '')
     record['segments'] = result.get('total_segments', 0)
+    problems = []
     if result.get('warning'):
-        record['error'] = result['warning']
+        problems.append(result['warning'])
+    if record['chapters_failed']:
+        problems.append(f"глав не распарсилось: {record['chapters_failed']}")
+    if record['chapters_blocked']:
+        problems.append(f"глав закрыто страницей-заглушкой: {record['chapters_blocked']}")
+    if problems:
+        record['error'] = ' | '.join(problems)
     record['saved_text'] = text if settings.save_text else ''
     record['elapsed'] = round(time.time() - started, 1)
     return record
@@ -252,6 +279,7 @@ def run_batch(
         render_wait=settings.render_wait,
         page_load_timeout=settings.page_load_timeout,
         block_images=settings.block_images,
+        profile_dir=None if settings.use_profile else '',
     )
     auth = None
 
@@ -361,9 +389,11 @@ def _empty_record(book_id: int, url: str = '') -> Dict:
         'chapters_parsed': 0,
         'chapters_total': 0,
         'chapters_failed': 0,
+        'chapters_blocked': 0,
         'chapters_locked': 0,
         'paid_chapter': None,
         'chars': 0,
+        'avg_chars': 0,
         'chunks_total': 0,
         'chunks_failed': 0,
         'segments': 0,
@@ -380,6 +410,7 @@ def _detail(info: Dict, result: Optional[Dict] = None) -> str:
     payload = {
         'chapter_results': (info or {}).get('chapter_results', [])[:400],
         'failed': (info or {}).get('failed', [])[:80],
+        'blocked': (info or {}).get('blocked', [])[:80],
         'sources': (info or {}).get('sources', {}),
     }
     if result:
@@ -399,5 +430,12 @@ def _log_record(cb: Callbacks, record: Dict) -> None:
         cb.safe_log(f"  ❌ {status}: {record.get('error')}")
     if record.get('chapters_locked'):
         cb.safe_log(f"  💰 глав закрыто платным доступом: {record['chapters_locked']}")
+    if record.get('chapters_blocked'):
+        cb.safe_log(f"  🚫 глав отдано страницей-заглушкой: {record['chapters_blocked']}"
+                    f"{' — ' + str(record.get('error'))[:100] if record.get('error') else ''}")
     if record.get('chapters_failed'):
         cb.safe_log(f"  ⚠️ глав пропущено после попыток: {record['chapters_failed']}")
+    if record.get('warning'):
+        cb.safe_log(f"  ⚠️ {record['warning']}")
+    if record.get('age_confirmed'):
+        cb.safe_log("  🔞 возрастной гейт подтверждён автоматически")

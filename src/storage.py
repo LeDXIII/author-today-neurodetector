@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS checks (
     chapters_total   INTEGER NOT NULL DEFAULT 0,
     chapters_failed  INTEGER NOT NULL DEFAULT 0,
     chapters_locked  INTEGER NOT NULL DEFAULT 0,
+    chapters_blocked INTEGER NOT NULL DEFAULT 0,
     paid_chapter INTEGER,
     chars        INTEGER NOT NULL DEFAULT 0,
     chunks_total  INTEGER NOT NULL DEFAULT 0,
@@ -62,8 +63,8 @@ CREATE INDEX IF NOT EXISTS idx_checks_status ON checks (status);
 LIGHT_COLUMNS = (
     'id', 'book_id', 'url', 'title', 'author', 'created_at', 'status',
     'ai_percent', 'human_percent', 'verdict', 'chapters_parsed', 'chapters_total',
-    'chapters_failed', 'chapters_locked', 'paid_chapter', 'chars', 'chunks_total',
-    'chunks_failed', 'error', 'detail', 'source', 'text_chars',
+    'chapters_failed', 'chapters_locked', 'chapters_blocked', 'paid_chapter', 'chars',
+    'chunks_total', 'chunks_failed', 'error', 'detail', 'source', 'text_chars',
 )
 
 
@@ -106,7 +107,8 @@ class History:
     def _migrate(self) -> None:
         """БД могла быть создана более ранней версией — добавляем недостающие колонки."""
         existing = {row[1] for row in self._conn.execute('PRAGMA table_info(checks)')}
-        for column, ddl in (('chapters_locked', 'INTEGER NOT NULL DEFAULT 0'),):
+        for column, ddl in (('chapters_locked', 'INTEGER NOT NULL DEFAULT 0'),
+                            ('chapters_blocked', 'INTEGER NOT NULL DEFAULT 0')):
             if column not in existing:
                 self._conn.execute(f'ALTER TABLE checks ADD COLUMN {column} {ddl}')
                 logger.info("История: добавлена колонка %s", column)
@@ -135,9 +137,9 @@ class History:
                         book_id, url, title, author, created_at, status,
                         ai_percent, human_percent, verdict,
                         chapters_parsed, chapters_total, chapters_failed, chapters_locked,
-                        paid_chapter, chars, chunks_total, chunks_failed,
+                        chapters_blocked, paid_chapter, chars, chunks_total, chunks_failed,
                         error, detail, source, text_gzip, text_chars)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     int(record.get('book_id') or 0), record.get('url', ''),
                     record.get('title', ''), record.get('author', ''), created,
@@ -148,6 +150,7 @@ class History:
                     int(record.get('chapters_total', 0) or 0),
                     int(record.get('chapters_failed', 0) or 0),
                     int(record.get('chapters_locked', 0) or 0),
+                    int(record.get('chapters_blocked', 0) or 0),
                     record.get('paid_chapter'),
                     int(record.get('chars', 0) or 0),
                     int(record.get('chunks_total', 0) or 0),
@@ -304,6 +307,7 @@ def render_report(rows: List[Dict]) -> str:
                      f" из {r.get('chapters_total', 0)}"
                      + (f", пропущено: {r['chapters_failed']}" if r.get('chapters_failed') else '')
                      + (f", закрыто платным: {r['chapters_locked']}" if r.get('chapters_locked') else '')
+                     + (f", заглушка: {r['chapters_blocked']}" if r.get('chapters_blocked') else '')
                      + (f", остановка на главе #{r['paid_chapter']}" if r.get('paid_chapter') else ''))
         lines.append(f"   Символов проанализировано: {r.get('chars', 0):,}".replace(',', ' '))
         if r.get('status') == 'ok' and r.get('ai_percent') is not None:

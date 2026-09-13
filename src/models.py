@@ -20,12 +20,14 @@ class Chapter:
 
 class ChapterStatus(str, Enum):
     """Итог обработки одной главы. Разные причины пустого текста критично различать:
-    платная глава — это конец бесплатного фрагмента, ошибка — это временный сбой,
-    который нельзя принимать за платную главу."""
+    платная глава — конец бесплатного фрагмента; ошибка — временный сбой, который
+    нельзя принимать за платную главу; BLOCKED — страница-заглушка (возрастной гейт),
+    которую не удалось снять."""
     OK = "ok"
     PAID = "paid"
     EMPTY = "empty"
     ERROR = "error"
+    BLOCKED = "blocked"
     SKIPPED = "skipped"
 
 
@@ -35,7 +37,7 @@ class ChapterResult:
     chapter: Chapter
     status: ChapterStatus
     text: str = ""
-    source: str = ""          # container-p | container | body | none
+    source: str = ""          # container-p | container | none
     attempts: int = 0
     error: str = ""
     elapsed: float = 0.0

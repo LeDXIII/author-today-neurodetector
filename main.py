@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.pipeline import BookTarget, Callbacks, Settings, parse_targets, run_batch
+from src.reader import MIN_AVG_CHAPTER
 from src.storage import History, fmt_dt, render_report
 
 os.environ['PYTHONIOENCODING'] = 'utf-8'
@@ -43,17 +44,22 @@ STATUS_LABELS = {
     'partial': '⚠ частично',
     'detect_failed': '✗ детектор',
     'no_text': '✗ нет текста',
+    'blocked': '🚫 заглушка сайта',
     'parse_crash': '✗ сбой парсинга',
     'stopped': '⏸ остановлен',
     'skipped_cached': '⏭ уже была',
 }
+
+# Столько знаков в среднем на главу — признак, что текст книги мы не увидели
+# (именно так выглядели ложные «0% / написан человеком» в отчётах беты).
+# Порог один на весь проект — объявлен в парсере, MIN_AVG_CHAPTER.
 
 GREEN, ORANGE, RED, BLUE, DIM = '#4caf50', '#ffb74d', '#ef5350', '#64b5f6', '#9e9e9e'
 
 COLUMNS = [
     ('#', 44),
     ('Книга', 330),
-    ('Статус', 110),
+    ('Статус', 130),
     ('Глав', 78),
     ('Пропуск', 74),
     ('Замки', 66),
@@ -143,18 +149,22 @@ class BookTableModel(QAbstractTableModel):
         self.endResetModel()
 
     def failed_ids(self) -> List[BookTarget]:
+        """Книги, которые стоит перепроверить: всё, что не «ok», плюс «ok» с малым текстом."""
         return [BookTarget(book_id=r['book_id'], url=r.get('url', ''))
                 for r in self._rows
-                if r.get('status') not in ('ok', 'pending') and r.get('book_id')]
+                if r.get('book_id') and (r.get('status') not in ('ok', 'pending') or self._is_thin(r))]
 
     def counts(self) -> Dict[str, int]:
-        out = {'total': len(self._rows), 'ok': 0, 'failed': 0, 'high_ai': 0, 'chapters': 0}
+        out = {'total': len(self._rows), 'ok': 0, 'failed': 0, 'high_ai': 0,
+               'suspicious': 0, 'chapters': 0}
         for r in self._rows:
             status = r.get('status')
             if status == 'ok':
                 out['ok'] += 1
             elif status != 'pending':
                 out['failed'] += 1
+            if self._is_thin(r):
+                out['suspicious'] += 1
             if (r.get('ai_percent') or 0) >= 50:
                 out['high_ai'] += 1
             out['chapters'] += int(r.get('chapters_parsed') or 0)
@@ -171,13 +181,19 @@ class BookTableModel(QAbstractTableModel):
             author = rec.get('author')
             return f"{title} — {author}" if author else title
         if col == 2:
+            if rec.get('status') == 'ok' and self._is_thin(rec):
+                return '⚠ мало текста'
             return STATUS_LABELS.get(rec.get('status', ''), rec.get('status', ''))
         if col == 3:
             parsed = int(rec.get('chapters_parsed') or 0)
             total = int(rec.get('chapters_total') or 0)
             return f"{parsed}/{total}" if total else str(parsed)
         if col == 4:
-            return int(rec.get('chapters_failed') or 0) or ''
+            failed = int(rec.get('chapters_failed') or 0)
+            blocked = int(rec.get('chapters_blocked') or 0)
+            if failed and blocked:
+                return f"{failed}+{blocked}🚫"
+            return failed or blocked or ''
         if col == 5:
             locked = int(rec.get('chapters_locked') or 0)
             paid = rec.get('paid_chapter')
@@ -198,14 +214,29 @@ class BookTableModel(QAbstractTableModel):
                 return f"{float(secs):.0f}с"
             return fmt_dt(rec.get('created_at')).split(' ')[-1] if rec.get('created_at') else ''
         if col == 10:
-            return (rec.get('error') or '')[:120]
+            return (rec.get('error') or rec.get('warning') or '')[:120]
         return None
+
+    @staticmethod
+    def _avg_chars(rec: Dict) -> int:
+        parsed = int(rec.get('chapters_parsed') or 0)
+        chars = int(rec.get('chars') or 0)
+        if rec.get('avg_chars'):
+            return int(rec['avg_chars'])
+        return chars // parsed if parsed else 0
+
+    @classmethod
+    def _is_thin(cls, rec: Dict) -> bool:
+        """Мало текста на главу — вердикту доверять нельзя."""
+        parsed = int(rec.get('chapters_parsed') or 0)
+        return bool(parsed) and cls._avg_chars(rec) < MIN_AVG_CHAPTER
 
     def _color(self, rec: Dict, col: int) -> str:
         status = rec.get('status')
+        thin = self._is_thin(rec)
         if col == 2:
             if status == 'ok':
-                return GREEN
+                return ORANGE if thin else GREEN
             if status == 'partial':
                 return ORANGE
             if status == 'pending':
@@ -215,19 +246,29 @@ class BookTableModel(QAbstractTableModel):
             ai = rec.get('ai_percent')
             if ai is None:
                 return ''
+            # Низкий процент на малом объёме — это не «чисто», это «мы ничего не увидели».
+            if thin:
+                return ORANGE
             return RED if ai >= 50 else (ORANGE if ai >= 5 else GREEN)
-        if col == 4 and int(rec.get('chapters_failed') or 0) > 0:
+        if col == 4 and (int(rec.get('chapters_failed') or 0) or int(rec.get('chapters_blocked') or 0)):
             return ORANGE
         if col == 5:
             return ORANGE
-        if col == 10 and status != 'ok' and rec.get('error'):
-            return RED
+        if col == 6 and thin:
+            return ORANGE
+        if col == 10 and (status != 'ok' or thin) and (rec.get('error') or rec.get('warning')):
+            return ORANGE if status == 'ok' else RED
         return ''
 
     def _tooltip(self, rec: Dict) -> str:
         lines = [rec.get('url') or f"book {rec.get('book_id')}"]
         if rec.get('author'):
             lines.append(f"автор: {rec['author']}")
+        if rec.get('chapters_parsed'):
+            lines.append(f"в среднем {self._avg_chars(rec):,} знаков на главу".replace(',', ' '))
+        if self._is_thin(rec):
+            lines.append("⚠ текста на главу подозрительно мало: похоже на то, что сайт "
+                         "не отдал текст, а детектор видел служебные строки страницы")
         if rec.get('segments'):
             lines.append(f"сегментов: {rec['segments']}")
         if rec.get('chunks_total'):
@@ -267,11 +308,15 @@ class BookFilterProxy(QSortFilterProxyModel):
         if not rec:
             return False
         status = rec.get('status')
-        if self._status == 'failed' and status == 'ok':
+        if self._status == 'failed' and status == 'ok' and not model._is_thin(rec):
             return False
         if self._status == 'high' and (rec.get('ai_percent') or 0) < 50:
             return False
         if self._status == 'locked' and not (rec.get('chapters_locked') or rec.get('paid_chapter')):
+            return False
+        if self._status == 'thin' and not model._is_thin(rec):
+            return False
+        if self._status == 'blocked' and status != 'blocked' and not rec.get('chapters_blocked'):
             return False
         if self._search:
             haystack = f"{rec.get('title','')} {rec.get('author','')} {rec.get('book_id','')}".lower()
@@ -410,6 +455,12 @@ class DetailDialog(QDialog):
                 parts.append(f"  {ch.get('num')}. {ch.get('title')} [{ch.get('status')}] "
                              f"{ch.get('chars')} симв. из {ch.get('source')}, "
                              f"попыток {ch.get('attempts')}, {ch.get('elapsed')}с{err}")
+            blocked = parsed.get('blocked') or []
+            if blocked:
+                parts.append("")
+                parts.append("— закрыто страницей-заглушкой (текст не отдан) —")
+                for ch in blocked:
+                    parts.append(f"  {ch.get('num')}. {ch.get('title')} — {ch.get('reason')}")
             chunks = parsed.get('chunks') or []
             if chunks:
                 parts.append("")
@@ -473,6 +524,12 @@ class SettingsDialog(QDialog):
         self.save_text = QCheckBox('кэшировать текст книг для повтора без пере-парсинга')
         self.save_text.setChecked(settings.save_text)
 
+        self.use_profile = QCheckBox('переиспользовать профиль Chrome (быстрее проходит 18+ гейт)')
+        self.use_profile.setToolTip("В профиле остаётся кука AdultUser и сервисные куки сайта:\n"
+                                     "возрастной гейт подтверждается один раз, а не на каждой книге.\n"
+                                     "Отключите, если нужен чистый браузер при каждом запуске.")
+        self.use_profile.setChecked(settings.use_profile)
+
         layout.addRow('Ждать JS-рендер:', self.render_wait)
         layout.addRow('Таймаут загрузки страницы:', self.page_timeout)
         layout.addRow('Попыток на главу:', self.chapter_attempts)
@@ -481,6 +538,7 @@ class SettingsDialog(QDialog):
         layout.addRow('', self.headless)
         layout.addRow('', self.block_images)
         layout.addRow('', self.save_text)
+        layout.addRow('', self.use_profile)
         layout.addRow(QLabel('Меньше «символов на запрос» — надёжнее, но запросов больше.\n'
                              'Яндекс обрывает обработку примерно на 30 секундах.'))
 
@@ -499,6 +557,7 @@ class SettingsDialog(QDialog):
         target.headless = self.headless.isChecked()
         target.block_images = self.block_images.isChecked()
         target.save_text = self.save_text.isChecked()
+        target.use_profile = self.use_profile.isChecked()
         return target
 
 
@@ -657,7 +716,9 @@ class MainWindow(QMainWindow):
         splitter.setOrientation(Qt.Orientation.Vertical)
 
         self.run_filter = QComboBox()
-        self.run_filter.addItems(['все', 'только с ошибками', 'подозрение на ИИ', 'с платными главами'])
+        self.run_filter.addItems(['все', 'только с ошибками', 'подозрение на ИИ',
+                                  'с платными главами', 'мало текста на главу',
+                                  'заглушка сайта (18+/вход)'])
         self.run_filter.currentIndexChanged.connect(self._apply_run_filter)
 
         table_header = QHBoxLayout()
@@ -705,7 +766,8 @@ class MainWindow(QMainWindow):
 
         self.history_filter = QComboBox()
         self.history_filter.addItems(['все', 'только с ошибками', 'подозрение на ИИ',
-                                      'с платными главами'])
+                                      'с платными главами', 'мало текста на главу',
+                                      'заглушка сайта (18+/вход)'])
         self.history_filter.currentIndexChanged.connect(self._apply_history_filter)
         row.addWidget(self.history_filter, 1)
 
@@ -756,7 +818,7 @@ class MainWindow(QMainWindow):
         data = {}
         for key in ('max_chapters', 'delay', 'use_login', 'block_images', 'headless',
                     'chapter_attempts', 'render_wait', 'page_load_timeout', 'chunk_chars',
-                    'detector_attempts', 'skip_checked_hours', 'save_text'):
+                    'detector_attempts', 'skip_checked_hours', 'save_text', 'use_profile'):
             value = qs.value(key, None)
             if value is not None:
                 data[key] = value
@@ -972,7 +1034,8 @@ class MainWindow(QMainWindow):
     def _update_counters(self) -> None:
         c = self.run_model.counts()
         self.stats_label.setText(f"книг: {c['total']} · ок: {c['ok']} · ошибок: {c['failed']}"
-                                 f" · ИИ≥50%: {c['high_ai']}")
+                                 f" · ИИ≥50%: {c['high_ai']}"
+                                 + (f" · под вопросом: {c['suspicious']}" if c['suspicious'] else ''))
         total = c['total']
         if total and self._run_started:
             done = c['ok'] + c['failed']
@@ -1002,7 +1065,8 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _filter_value(index: int) -> str:
-        return {0: 'all', 1: 'failed', 2: 'high', 3: 'locked'}.get(index, 'all')
+        return {0: 'all', 1: 'failed', 2: 'high', 3: 'locked',
+                4: 'thin', 5: 'blocked'}.get(index, 'all')
 
     def _purge_text(self) -> None:
         answer = QMessageBox.question(
